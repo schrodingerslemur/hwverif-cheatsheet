@@ -6,10 +6,10 @@
 select_coverage -block -expr -toggle -fsm 
 set_statement_scoring
 set_branch_scoring
-//set_fsm_scoring -hold_transition on
-//set_fsm_arc_scoring
-//set_fsm_reset_scoring
-//set_explicit_block_scoring -off
+set_fsm_scoring -hold_transition on
+set_fsm_arc_scoring
+set_fsm_reset_scoring
+//set_explicit_block_scoring -off // uncomment to get rid of redundant cases
 //set_toggle_scoring -sv_enum
 ```
 
