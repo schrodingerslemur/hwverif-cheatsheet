@@ -14,6 +14,26 @@ endfunction
 ```
 
 ## Coverage
+### Types of coverage
+1) Line coverage
+    - Checks whether all lines were executed
+2) Block/branch coverage 
+    - Checks whether all blocks of code were executed
+    - i.e. every always block, if, case statement
+3) Expression coverage
+    - Checks whether all parts of an expression was executed
+    - Creates a truth table without useless cases
+    - i.e. for a && b: `2'b11`, `2'b0x`, and `2'bx0` are checked
+4) Toggle coverage
+    - Checks whether every bit of every signal is toggled from 0-to-1 and 1-to-0
+5) FSM coverage
+    - Checks whether every state and state transition is exercised
+
+### Coverage terminology
+**bins**: enumerated buckets of all scenarios for given coverage metric <br>
+**hole**: all unvisited bin
+
+### Coverage analysis
 1) Create `covfile.cf` with this content:
 ```systemverilog
 select_coverage -block -expr -toggle -fsm 
