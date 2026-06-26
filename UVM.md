@@ -88,4 +88,15 @@ static function void <set>/<get> (
 > `cntxt` is mostly *this* or *null* <br>
 > `"uvm_test_top"` is convention for `inst_name`
 
-## UVM Components
+## UVM Phases
+Only the important ones:
+1) Build phase: top to bottom
+  - Memory allocation
+2) Connect phase: bottom to top
+  - Handler/pointer sharing, connection between components
+3) Run phase
+  - Consumes time
+
+## UVM components
+
+
