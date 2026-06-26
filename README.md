@@ -1,4 +1,17 @@
 # hwverif-cheatsheet
+## Transaction-Level Modelling (TLM)
+Write stimuli as a form of transactions (functions)
+
+Example:
+```systemverilog
+function automatic write(addr, data);
+  bus.we <= 1'b1;
+  bus.re <= 1'b0;
+  bus.addr <= addr;
+  bus.data <= data;
+  @(posedge bus.clk);
+endfunction
+```
 
 ## Coverage
 1) Create `covfile.cf` with this content:
