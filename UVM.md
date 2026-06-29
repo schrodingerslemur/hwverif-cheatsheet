@@ -102,13 +102,17 @@ The following follows RSP-REQ model with focus on drv-seq-mon interaction and ag
 
 ### Driver
 1) Implement all UVM import + class stuff
-2) Get virtual interface from UVM config db in build_phase
-3) Implement RSP-REQ protocol in run_phase
+2) Declare virtual interace
+3) Get virtual interface from UVM config db in build_phase
+4) Implement RSP-REQ protocol in run_phase
    
 drv.svh:
 ```systemverilog
 class drv extends uvm_driver#(req_item, rsp_item);
   `uvm_component_utils(drv)
+
+  // Declare virtual interface
+  virtual <interface_type>#(<interface_params>) bus;
 
   function new(string name="drv", uvm_component parent);
     super.new(name, parent);
@@ -186,13 +190,57 @@ endclass: agt
 
 ### Monitor
 1) Implement all UVM class + import stuff
-2) Get virtual interface from UVM Config DB in build_phase
-3) Implement model
+2) Declare virtual interface
+3) Get virtual interface from UVM Config DB in build_phase
+4) Implement model
 
 mon.svh:
 ```systemverilog
 class mon extends uvm_monitor;
   `uvm_component_utils(mon)
+
+  // Declare virtual interface
+  virtual <interface_type>#(<interface_params>) bus;
+
+  function new(string name="mon", uvm_component parent);
+        super.new(name, parent);
+  endfunction: new
+
+  // Get virtual interface
+  virtual function void build_phase(uvm_phase phase);
+        super.build_phase(phase);
+        if (!uvm_config_db#(virtual <interface_type>#(<interface_params>)::get(null,
+        "uvm_test_top", "vif", bus))
+            `uvm_fatal("mon", "Could not get vif")
+        `uvm_info(get_type_name(), $sformatf("end of build phase"), UVM_NONE)
+  endfunction
+
+  // Implement model
+  bit a, b, c;
+  bit q [$];
+  function reset_model();
+    q.delete();
+    {a, b, c} = '0;
+  endfunction: reset_model();
+
+  task run_phase(uvm_phase phase);
+    super.run_phase(phase);
+
+    forever begin
+      @(bus.mon_cb);
+
+      if (bus.mon_cb.rst_n == 1'b0) begin
+        reset_model();
+        continue;
+      end
+
+      // Decode signals
+      // Based on decoded signals, simulate different changes
+    end
+  endtask: run_phase
+endclass: mon
+```
+  
   
 
 
