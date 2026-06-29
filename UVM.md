@@ -98,5 +98,101 @@ Only the important ones:
   - Consumes time
 
 ## UVM components
+The following follows RSP-REQ model with focus on drv-seq-mon interaction and agent connection. Will show driver, agent and monitor code
+
+### Driver
+1) Implement all UVM import + class stuff
+2) Get virtual interface from UVM config db in build_phase
+3) Implement RSP-REQ protocol in run_phase
+   
+drv.svh:
+```systemverilog
+class drv extends uvm_driver#(req_item, rsp_item);
+  `uvm_component_utils(drv)
+
+  function new(string name="drv", uvm_component parent);
+    super.new(name, parent);
+  endfunction: new
+
+  function void build_phase(uvm_phase phase);
+    super.build_phase(phase);
+
+    // Get virtual interface
+    if (!uvm_config_db #(virtual <interface_type>#(<interface_params>))::get(null,
+        "uvm_test_top", "vif", bus))
+            `uvm_fatal("LOG", "VIF not found");
+        `uvm_info(get_type_name(), $sformatf("end of build phase"), UVM_NONE)
+  endfunction: build_phase
+
+  task run_phase(uvm_phase phase);
+    req_item m_req;
+    rsp_item m_rsp;
+
+    // Implement RSP-REQ protocol
+    forever begin
+      seq_item_port.get_next_item(m_req); // get next item from sequencer
+      m_rsp = rsp_item::type_id::create("m_rsp"); create rsp object (req was created by sequencer)
+      m_rsp.set_id_info(m_req); // associate req with rsp
+
+      @(bus.drv_cb); // clocking block
+      // drive all output signals with NB assignments
+      bus.drv_cb.rst_n <= m_req.rst_n;
+      ...
+
+      // drive all input signals with B assignments
+      m_rsp.data = bus.drv_cb.data;
+
+      // Call done on item
+      seq_item_port.item_done(m_rsp);
+    end
+  endtask: run_phase
+endclass: drv
+```
+
+### Agent
+1) Implement all UVM class + import stuff
+2) Create driver, monitor, and sequence objects in build_phase
+3) Connect sequencer to driver in connect_phase
+
+agt.svh:
+```systemverilog
+class agt extends uvm_agent;
+    `uvm_component_utils(agt)
+
+    drv m_drv;
+    mon m_mon;
+    uvm_sequencer #(req_item, rsp_item) m_sqr;
+
+    function new(string name="agt", uvm_component
+    parent);
+        super.new(name, parent);
+    endfunction: new
+
+    // Create driver, monitor and sequencer
+    function void build_phase(uvm_phase phase);
+        super.build_phase(phase);
+        m_drv = drv::type_id::create("m_drv", this);
+        m_mon = mon::type_id::create("m_mon", this);
+        m_sqr = uvm_sequencer #(req_item, rsp_item)::type_id::create("m_sqr", this);
+        `uvm_info(get_type_name(), $sformatf("end of build phase"), UVM_NONE)
+    endfunction: build_phase
+
+    // Connect driver to sequencer
+    function void connect_phase(uvm_phase phase);
+        m_drv.seq_item_port.connect(m_sqr.seq_item_export);
+    endfunction: connect_phase
+endclass: agt
+```
+
+### Monitor
+1) Implement all UVM class + import stuff
+2) Get virtual interface from UVM Config DB in build_phase
+3) Implement model
+
+mon.svh:
+```systemverilog
+class mon extends uvm_monitor;
+  `uvm_component_utils(mon)
+  
 
 
