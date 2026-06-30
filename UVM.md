@@ -242,7 +242,196 @@ endclass: mon
 ```
 
 ## UVM sequences
+Sequences encapsulate and execute sequence items
 
-  
+First, create the basic `req_item` and `rsp_item`. Request items need constraints and should instantiate inputs into the DUT, response items do not need constraints and should instantiate outputs from the DUT.
 
+1) Implement UVM stuff
+2) Instantiate `rand` or normal signals
+3) Implement constraints, only for `req_item`
+
+seq.svh:
+```systemverilog
+class req_item extends uvm_sequence_item;
+  `uvm_object_utils(req_item)
+
+  // Rand and non-rand type variables
+  rand bit re;
+  rand bit we;
+  bit rst_n = 1'b1; // you can set variable values
+  rand bit [DATA_WIDTH-1:0] data;
+  rand bit [ADDR_WIDTH-1:0] addr;
+
+  // Implement constraint
+  constraint valid {addr dist {BASE_CFG:=20, [BASE_CMD: BASE_CMD + OP_LAST]:=20,
+  BASE_STATUS:=20, [BASE_DATA:BASE_DATA + FIFO_LENGTH]:=20}; }
+
+  function new(string name = "req_item");
+    super.new(name);
+  endfunction: new
+
+endclass: req_item
+
+class rsp_item extends uvm_sequence_item;
+  `uvm_object_utils(rsp_item)
+
+  // Normal variables without constraints
+  logic [DATA_WIDTH-1:0] data_to_system;
+  logic [DATA_WIDTH-1:0] data_op;
+
+  function new(string name = "rsp_item");
+    super.new(name);
+  endfunction: new
+
+endclass: rsp_item
+```
+
+Secondly, you can keep extending classes to build on top of request items (usually not response items).
+```systemverilog
+class write_req_item extends req_item;
+  `uvm_object_utils(write_req_item)
+
+  constraint force_write { we == 1'b1; re == 1'b0; }
+
+  function new(string name = "write_req_item");
+    super.new(name);
+  endfunction: new
+
+endclass: write_req_item
+```
+
+Thirdly, create sequences which execute the sequence items.
+
+1) Implement UVM macros
+2) Create handlers for the sequence items
+3) Create request item (not response item as driver creates them)
+4) Create a virtual task body
+5) Either call `uvm_do`/`uvm_do_with` or:
+     - Start item -> Randomize item -> Finish item -> Get response
+   
+```systemverilog
+class exec_seq extends uvm_sequence#(req_item, rsp_item);
+  `uvm_object_utils(exec_seq)
+
+  function new(string name = "");
+    super.new(name);
+  endfunction: new
+
+  // Create handlers
+  req_item req;
+  rsp_item rsp;
+
+  // Create other constrained random variables if required
+  rand bit [ADDR_WIDTH-1:0] op_addr;
+  constraint valid_op { op_addr inside {[BASE_CMD: BASE_CMD + OP_LAST]}; }
+
+  // Create virtual task body
+  virtual task body();
+    // Create request item
+    req = req_item::type_id::create("req");
+
+    // Start item -> Randomize item -> Finish item -> Get response
+    start_item(req);
+    if (!req.randomize() with { addr == op_addr; }) begin
+      `uvm_error(get_type_name, "Failed to randomize sequence item")
+    end
+    finish_item(req);
+    get_response(rsp);
+
+    // To deal with responses, do something like:
+    // done = !rsp.data_to_system[2];
+    // if (done) `uvm_do(req);
+
+    `uvm_info(get_type_name, $sformatf("RSP item: data_to_system=%h, data_op=%h",
+          rsp.data_to_system, rsp.data_op), UVM_MEDIUM)
+  endtask
+endclass: exec_seq
+```
+
+Fourthly, create parent sequences which call other sequences if required
+
+```systemverilog
+class fill_queue_seq extends uvm_sequence #(req_item, rsp_item);
+  `uvm_object_utils(fill_queue_seq)
+
+  function new(string name = "fill_queue_seq");
+    super.new(name);
+  endfunction
+
+  virtual task body();
+    exec_seq exec1;
+    repeat (32) begin
+      `uvm_do_with(
+        exec1,
+        { exec1.op_addr == BASE_CMD + OP_PUSH; }
+      )
+    end
+  endtask
+
+endclass: fill_queue_seq
+```
+
+Refer to **tst.svh** on how to choose which sequence to execute.
+
+## Encapsulating UVM components
+### Environment
+1) Instantiate agent handler
+2) Create agent in build phase
+
+env.svh:
+```systemverilog
+class env extends uvm_env;
+    `uvm_component_utils (env)
+    agt m_agt;
+
+    function new(string name="env", uvm_component
+    parent);
+        super.new(name, parent);
+    endfunction: new
+
+    virtual function void build_phase (uvm_phase phase);
+        super.build_phase (phase);
+        m_agt = agt::type_id::create ("m_agt", this);
+        `uvm_info(get_type_name(), $sformatf("end of build phase"), UVM_NONE)
+    endfunction
+endclass
+```
+
+### Test
+1) Instantiate environment handler
+2) Create environment in build phase
+3) Run sequences in run phase using `m_seq.start(m_env.m_agt.m_sqr)`
+
+tst.svh:
+```systemverilog
+class lab5 extends uvm_test;
+    `uvm_component_utils(lab5)
+
+    env m_env;
+
+    function new(string name="lab5", uvm_component
+    parent);
+        super.new(name, parent);
+    endfunction: new
+
+    // Create environment in build phase
+    virtual function void build_phase(uvm_phase phase);
+        super.build_phase (phase);
+        m_env = env::type_id::create ("m_env", this);
+        `uvm_info (get_type_name(), $sformatf ("end of build phase"), UVM_NONE)
+    endfunction
+
+    virtual task run_phase(uvm_phase phase);
+        seq1 m_seq = seq1::type_id::create("m_seq");
+
+        // This is not required unless you have rand variables in sequence.
+        if (!m_seq.randomize()) `uvm_error(get_type_name, "randomize failed")
+
+        super.run_phase(phase);
+        phase.raise_objection (this); // let me run...
+        m_seq.start(m_env.m_agt.m_sqr);
+        phase.drop_objection (this); // ...done running
+    endtask
+endclass: lab5
+```
 
