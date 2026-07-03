@@ -50,6 +50,7 @@ set_fsm_reset_scoring
 ```bash
 xrun <sv_files> -covfile covfile.cf [-covoverwrite] [-covdut <dut_module_name>] [-covtest <test_name>]
 ```
+> To cover all the categories, replace `-covfile covfile.cv` with `-coverage all`
 
 3) To open the GUI, run
 ```bash
