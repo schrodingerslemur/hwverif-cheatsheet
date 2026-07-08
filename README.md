@@ -51,6 +51,7 @@ set_fsm_reset_scoring
 xrun <sv_files> -covfile covfile.cf [-covoverwrite] [-covdut <dut_module_name>] [-covtest <test_name>]
 ```
 > To cover all the categories, replace `-covfile covfile.cv` with `-coverage all`
+> Multiple coverage DUTs can be passed, for example: `-covdut unitA -covdut unitB`
 
 3) To open the GUI, run
 ```bash
