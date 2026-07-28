@@ -156,17 +156,25 @@ endclass: drv
 ### Agent
 1) Implement all UVM class + import stuff
 2) Create driver, monitor, and sequence objects in build_phase
-3) Connect sequencer to driver in connect_phase
+3) Instantiate checker and coverage enable signals, and use uvm_config_db to get it (`test` sets it up) in build_phase
+5) Connect sequencer to driver in connect_phase
+6) Depending on enable signals, connect scoreboard, coverage collector and checker to monitor in connect_phase
 
 agt.svh:
 ```systemverilog
 class agt extends uvm_agent;
     `uvm_component_utils(agt)
 
+    // Create components
     drv m_drv;
     mon m_mon;
     uvm_sequencer #(req_item, rsp_item) m_sqr;
+    scb m_scb; cov m_cov; chk m_chk;
 
+    // Instantiate enable signals
+    bit enable_cov = 0;
+    bit enable_chk = 0;
+    
     function new(string name="agt", uvm_component
     parent);
         super.new(name, parent);
@@ -178,21 +186,49 @@ class agt extends uvm_agent;
         m_drv = drv::type_id::create("m_drv", this);
         m_mon = mon::type_id::create("m_mon", this);
         m_sqr = uvm_sequencer #(req_item, rsp_item)::type_id::create("m_sqr", this);
+
+        // Get enable_chk and enable_cov
+        if (!uvm_config_db#(bit)::get(this, "", "enable_cov", enable_cov))
+            `uvm_fatal(get_type_name(), "Bad config")
+        if (!uvm_config_db#(bit)::get(this, "", "enable_chk", enable_chk))
+            `uvm_fatal(get_type_name(), "Bad config")
+
+        // Use enable_chk and enable_cov to decide whether to create cov, chk and scb.
+        if (enable_cov) begin
+            `uvm_info(get_type_name(), $sformatf("enable_cov is set"), UVM_NONE)
+             m_cov = cov::type_id::create("m_cov", this);
+        end
+        if (enable_chk) begin
+            `uvm_info(get_type_name(), $sformatf("enable_chk is set"), UVM_NONE)
+            m_chk = chk::type_id::create("m_chk", this);
+            m_scb = scb::type_id::create("m_scb", this);
+        end
+  
         `uvm_info(get_type_name(), $sformatf("end of build phase"), UVM_NONE)
     endfunction: build_phase
 
-    // Connect driver to sequencer
     function void connect_phase(uvm_phase phase);
+        // Connect driver to sequencer
         m_drv.seq_item_port.connect(m_sqr.seq_item_export);
+
+        // Connect cov, chk and scb to mon
+        if (enable_cov) m_mon.m_cov_port.connect(m_cov.analysis_export);
+        if (enable_chk) begin
+            m_mon.m_chk_port.connect(m_chk.analysis_export);
+            m_mon.m_port.connect(m_scb.m_port);
+        end
     endfunction: connect_phase
 endclass: agt
 ```
 
 ### Monitor
 1) Implement all UVM class + import stuff
-2) Declare virtual interface
-3) Get virtual interface from UVM Config DB in build_phase
-4) Implement model
+3) Declare virtual interface
+4) Get virtual interface from UVM Config DB in build_phase
+5) Instantiate analysis ports and create them in build_phase
+6) Create req, rsp and full items in run_phase
+7) Use B assignments to set req, rsp and full item signals in run_phase
+8) Write to analysis ports in run_phase
 
 mon.svh:
 ```systemverilog
@@ -201,6 +237,11 @@ class mon extends uvm_monitor;
 
   // Declare virtual interface
   virtual <interface_type>#(<interface_params>) bus;
+
+  // Instantiate analysis ports
+  uvm_analysis_port #(full_item) m_port;
+  uvm_analysis_port #(req_item) m_cov_port;
+  uvm_analysis_port #(full_item) m_chk_port;
 
   function new(string name="mon", uvm_component parent);
         super.new(name, parent);
@@ -212,31 +253,45 @@ class mon extends uvm_monitor;
         if (!uvm_config_db#(virtual <interface_type>#(<interface_params>)::get(null,
         "uvm_test_top", "vif", bus))
             `uvm_fatal("mon", "Could not get vif")
+
+        // Create analysis ports
+        m_port = new("m_port", this);
+        m_cov_port = new("m_cov_port", this);
+        m_chk_port = new("m_chk_port", this);
+
         `uvm_info(get_type_name(), $sformatf("end of build phase"), UVM_NONE)
   endfunction
-
-  // Implement model
-  bit a, b, c;
-  bit q [$];
-  function reset_model();
-    q.delete();
-    {a, b, c} = '0;
-  endfunction: reset_model();
 
   task run_phase(uvm_phase phase);
     super.run_phase(phase);
 
+    // Write to analysis ports using items
     forever begin
-      @(bus.mon_cb);
+        req_item req = req_item::type_id::create("req");
+        rsp_item rsp = rsp_item::type_id::create("rsp");
+        full_item full = full_item::type_id::create("full");
 
-      if (bus.mon_cb.rst_n == 1'b0) begin
-        reset_model();
-        continue;
+        @(bus.mon_cb);
+
+        req.rst_n = bus.mon_cb.rst_n;
+        req.re = bus.mon_cb.re;
+        req.we = bus.mon_cb.we;
+        req.addr = bus.mon_cb.addr;
+        req.data = bus.mon_cb.data_from_system;
+
+        rsp.data_to_system = bus.mon_cb.data_to_system;
+        rsp.data_op = bus.mon_cb.data_op;
+
+        full.m_req_item = req;
+        full.m_rsp_item = rsp;
+
+        fork
+          m_port.write(full);
+          m_cov_port.write(req);
+          m_chk_port.write(full);
+        join
       end
-
-      // Decode signals
-      // Based on decoded signals, simulate different changes
-    end
+  
   endtask: run_phase
 endclass: mon
 ```
@@ -244,7 +299,7 @@ endclass: mon
 ## UVM sequences
 Sequences encapsulate and execute sequence items
 
-First, create the basic `req_item` and `rsp_item`. Request items need constraints and should instantiate inputs into the DUT, response items do not need constraints and should instantiate outputs from the DUT.
+First, create the basic `req_item` and `rsp_item` (and optionally `full_item`). Request items need constraints and should instantiate inputs into the DUT, response items do not need constraints and should instantiate outputs from the DUT.
 
 1) Implement UVM stuff
 2) Instantiate `rand` or normal signals
@@ -284,6 +339,18 @@ class rsp_item extends uvm_sequence_item;
   endfunction: new
 
 endclass: rsp_item
+
+class full_item extends uvm_sequence_item;
+  `uvm_object_utils(full_item)
+
+  req_item m_req_item;
+  rsp_item m_rsp_item;
+
+  function new(string name="full_item");
+    super.new(name);
+  endfunction: new
+
+endclass: full_item
 ```
 
 Secondly, you can keep extending classes to build on top of request items (usually not response items).
@@ -377,12 +444,15 @@ Refer to **tst.svh** on how to choose which sequence to execute.
 ### Environment
 1) Instantiate agent handler
 2) Create agent in build phase
+3) Instantiate enable signals and pass them down to agent
 
 env.svh:
 ```systemverilog
 class env extends uvm_env;
     `uvm_component_utils (env)
     agt m_agt;
+    bit enable_chk = 0;
+    bit enable_cov = 0;
 
     function new(string name="env", uvm_component
     parent);
@@ -392,6 +462,17 @@ class env extends uvm_env;
     virtual function void build_phase (uvm_phase phase);
         super.build_phase (phase);
         m_agt = agt::type_id::create ("m_agt", this);
+
+        // scope is uvm_test_top.m_env (current component "this" is m_env)
+        if (!uvm_config_db#(bit)::get(this, "", "enable_cov", enable_cov))
+            `uvm_fatal(get_type_name(), "Bad config")
+        if (!uvm_config_db#(bit)::get(this, "", "enable_chk", enable_chk))
+            `uvm_fatal(get_type_name(), "Bad config")
+
+        // scope is uvm_test_top.m_env.* (everything under m_env)
+        uvm_config_db#(bit)::set(this, "*", "enable_cov", enable_cov);
+        uvm_config_db#(bit)::set(this, "*", "enable_chk", enable_chk);
+
         `uvm_info(get_type_name(), $sformatf("end of build phase"), UVM_NONE)
     endfunction
 endclass
@@ -400,7 +481,8 @@ endclass
 ### Test
 1) Instantiate environment handler
 2) Create environment in build phase
-3) Run sequences in run phase using `m_seq.start(m_env.m_agt.m_sqr)`
+3) Decide what to set enable signals to
+4) Run sequences in run phase using `m_seq.start(m_env.m_agt.m_sqr)`
 
 tst.svh:
 ```systemverilog
@@ -417,7 +499,13 @@ class lab5 extends uvm_test;
     // Create environment in build phase
     virtual function void build_phase(uvm_phase phase);
         super.build_phase (phase);
+
+        // scope is uvm_test_top.m_env for enable signals
+        uvm_config_db #(bit)::set(this, "m_env", "enable_cov", 1);
+        uvm_config_db #(bit)::set(this, "m_env", "enable_chk", 1);
+
         m_env = env::type_id::create ("m_env", this);
+
         `uvm_info (get_type_name(), $sformatf ("end of build phase"), UVM_NONE)
     endfunction
 
@@ -433,5 +521,17 @@ class lab5 extends uvm_test;
         phase.drop_objection (this); // ...done running
     endtask
 endclass: lab5
+```
+
+## Running commands
+run.sh:
+```bash
+#!/bin/bash
+# Run the full test suite. Pass a single test name to run just that one:
+#   ./run.sh                 # run everything
+#   ./run.sh lab6_vliw       # run one test
+FILES="vliw.cpp params_pkg.sv lab_pkg.sv top_hdl.sv top_hvl.sv system_bus.sv streaming_engine.sv assertions.sv"
+
+xrun $FILES -uvm +UVM_TESTNAME="$1"
 ```
 
