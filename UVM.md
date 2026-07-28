@@ -10,24 +10,30 @@ HDL top and HVL top
 Example (hdl_top.sv):
 ```systemverilog
 module hdl_top();
-  // Instantiate interface
-  system_bus #(...) bus(...);
+  import params_pkg::*;
 
-  // Instantiate DUT
-  streaming_engine #(...) dut(...);
-
-  // Create clock
+  // Create clock. Declare it before the interface so it can be passed in.
   bit clk;
   initial clk = 0;
   always begin
     #10; clk = ~clk;
   end
-  assign bus.clk = clk;
 
-  // Register virtual interface into UVM config db
+  // Instantiate interface. clk is an input port of the interface, so drive it
+  // here at instantiation -- do NOT also write `assign bus.clk = clk;`
+  system_bus #(
+    .ADDR_WIDTH(ADDR_WIDTH),
+    .DATA_WIDTH(DATA_WIDTH)
+  ) bus (.clk(clk));
+
+  // Instantiate DUT
+  streaming_engine dut(.bus(bus));
+
+  // Register virtual interface into UVM config db.
+  // The field name here ("vif") MUST match the name every component gets with.
   initial begin
     import uvm_pkg::uvm_config_db;
-    uvm_config_db#(virtual system_bus)::set(null, "uvm_test_top", "system_bus", bus);
+    uvm_config_db#(virtual system_bus#(.ADDR_WIDTH(ADDR_WIDTH), .DATA_WIDTH(DATA_WIDTH)))::set(null, "uvm_test_top", "vif", bus);
   end
 endmodule: hdl_top
 ```
@@ -74,7 +80,7 @@ endpackage: lab_pkg
 Allows to get/set `value` for `field_name` in `inst_name` using UVM component `cntxt` as starting search point <br>
 Example:
 ```systemverilog
-uvm_config_db#(virtual system_bus)::set(null, "uvm_test_top", "system_bus", bus);
+uvm_config_db#(virtual system_bus)::set(null, "uvm_test_top", "vif", bus);
 ```
 Parameters:
 ```
@@ -86,7 +92,8 @@ static function void <set>/<get> (
 );
 ```
 > `cntxt` is mostly *this* or *null* <br>
-> `"uvm_test_top"` is convention for `inst_name`
+> `"uvm_test_top"` is convention for `inst_name` <br>
+> `field_name` must be **identical** on the `set` and every `get`, or the `get` returns 0
 
 ## UVM Phases
 Only the important ones:
@@ -135,7 +142,7 @@ class drv extends uvm_driver#(req_item, rsp_item);
     // Implement RSP-REQ protocol
     forever begin
       seq_item_port.get_next_item(m_req); // get next item from sequencer
-      m_rsp = rsp_item::type_id::create("m_rsp"); create rsp object (req was created by sequencer)
+      m_rsp = rsp_item::type_id::create("m_rsp"); // create rsp object (req was created by sequencer)
       m_rsp.set_id_info(m_req); // associate req with rsp
 
       @(bus.drv_cb); // clocking block
@@ -155,7 +162,7 @@ endclass: drv
 
 ### Agent
 1) Implement all UVM class + import stuff
-2) Create driver, monitor, and sequence objects in build_phase
+2) Create driver, monitor, and sequencer objects in build_phase
 3) Instantiate checker and coverage enable signals, and use uvm_config_db to get it (`test` sets it up) in build_phase
 5) Connect sequencer to driver in connect_phase
 6) Depending on enable signals, connect scoreboard, coverage collector and checker to monitor in connect_phase
@@ -250,7 +257,7 @@ class mon extends uvm_monitor;
   // Get virtual interface
   virtual function void build_phase(uvm_phase phase);
         super.build_phase(phase);
-        if (!uvm_config_db#(virtual <interface_type>#(<interface_params>)::get(null,
+        if (!uvm_config_db#(virtual <interface_type>#(<interface_params>))::get(null,
         "uvm_test_top", "vif", bus))
             `uvm_fatal("mon", "Could not get vif")
 
