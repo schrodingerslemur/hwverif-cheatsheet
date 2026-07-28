@@ -69,6 +69,9 @@ package lab_pkg;
     `include "operations.svh"
     `include "seq.svh"
     `include "drv.svh"
+    `include "cov.svh"
+    `include "chk.svh"
+    `include "scb.svh"
     `include "mon.svh"
     `include "agt.svh"
     `include "env.svh"
@@ -303,6 +306,297 @@ class mon extends uvm_monitor;
 endclass: mon
 ```
 
+### TLM analysis ports (how mon talks to scb/chk/cov)
+The monitor **broadcasts**; the scoreboard, checker and coverage collector **receive**. There are two ways to build the receiving end, and the agent's `connect_phase` uses both — that's why the two `connect` calls look different.
+
+| Receiver style | Port handle on receiver | Who creates the handle | Connect call |
+|---|---|---|---|
+| `uvm_scoreboard` + `uvm_analysis_imp #(T, receiver)` | you declare `m_port` | you (`new()` or `build_phase`) | `m_mon.m_port.connect(m_scb.m_port)` |
+| `uvm_subscriber #(T)` | `analysis_export`, free | UVM | `m_mon.m_chk_port.connect(m_chk.analysis_export)` |
+
+Both styles require the receiver to implement:
+```systemverilog
+function void write(T t);
+```
+> `uvm_subscriber`'s `write()` is pure virtual — you *must* define it or the class won't compile.
+
+Rules of thumb:
+- A `uvm_analysis_port` is **1-to-many**: one `write()` reaches every connected receiver. You only need a *separate* port per transaction **type**, not per receiver. In `mon` above, `m_port` and `m_chk_port` are both `full_item` and could have been one port; `m_cov_port` is `req_item` so it must be its own.
+- Use `uvm_subscriber` when the component only listens to one stream (chk, cov). Use `uvm_analysis_imp` when you want to name the port yourself or receive more than one stream (each needs its own imp, via `` `uvm_analysis_imp_decl ``).
+- `write()` is a **function**, not a task — it cannot consume time. Do all waiting in the monitor.
+
+### Scoreboard
+1) Extend `uvm_scoreboard`, declare a `uvm_analysis_imp #(full_item, scb)` and create it
+2) Get `enable_chk` from the config db in build_phase (the `env` set it)
+3) Keep **spec-level** model state as class members
+4) In `write()`: bail out on `!enable_chk`, reset the model on `~rst_n`, decode the transaction, compare, then update the model
+
+> Model the **specification**, not the RTL. Track what the spec promises (counts, flags, ordering) — never mirror the DUT's internal pointers or registers, or the model will agree with the bug.
+
+scb.svh:
+```systemverilog
+class scb extends uvm_scoreboard;
+  `uvm_component_utils(scb)
+
+  bit enable_chk = 0;
+
+  // Declare the imp: #(transaction_type, this_class_type)
+  uvm_analysis_imp #(full_item, scb) m_port;
+
+  function new(string name, uvm_component parent);
+    super.new(name, parent);
+    m_port = new("m_port", this); // build_phase also works; must exist before connect_phase
+  endfunction: new
+
+  virtual function void build_phase(uvm_phase phase);
+    super.build_phase(phase);
+    if (!uvm_config_db#(bit)::get(this, "", "enable_chk", enable_chk))
+        `uvm_fatal(get_type_name(), "Bad config")
+  endfunction: build_phase
+
+  // Spec-level model state
+  bit [DATA_WIDTH-1:0] mode;
+  int unsigned count;
+
+  function void reset_model();
+    mode  = '0;
+    count = 0;
+  endfunction: reset_model
+
+  function void write(full_item t);
+    req_item req = t.m_req_item;
+    rsp_item rsp = t.m_rsp_item;
+    bit cfg_wr, cfg_rd, stat_rd, cmd_wr;
+    int op;
+
+    if (!enable_chk) return;
+
+    // Reset the model when the DUT is reset
+    if (~req.rst_n) begin
+      reset_model();
+      return;
+    end
+
+    // Decode the transaction
+    cfg_wr  = req.we && !req.re && (req.addr == BASE_CFG);
+    cfg_rd  = req.re && !req.we && (req.addr == BASE_CFG);
+    stat_rd = req.re && !req.we && (req.addr == BASE_STATUS);
+    cmd_wr  = req.we && !req.re && (req.addr >= BASE_CMD) && (req.addr <= BASE_CMD + OP_LAST);
+    op      = req.addr - BASE_CMD;
+
+    // Compare DUT response against the model
+    if (cfg_rd && rsp.data_to_system != mode)
+      `uvm_error(get_type_name(), $sformatf("Mode read-back mismatch: expected %0h, got %0h",
+                                            mode, rsp.data_to_system))
+
+    if (stat_rd) begin
+      bit expected_full_empty = (count == 0) || (count == FIFO_LENGTH);
+      if (rsp.data_to_system[1] != expected_full_empty)
+        `uvm_error(get_type_name(), $sformatf("Full/Empty mismatch: expected %0b, got %0b",
+                                              expected_full_empty, rsp.data_to_system[1]))
+    end
+
+    // Update the model
+    if (cfg_wr) mode = req.data;
+    if (cmd_wr) begin
+      case (op)
+        OP_PUSH: if (count < FIFO_LENGTH) count++;
+        OP_POP:  if (count > 0)           count--;
+        default: ; // ops with no effect on the count
+      endcase
+    end
+  endfunction: write
+endclass: scb
+```
+
+### Checker
+Same idea as the scoreboard, but extends `uvm_subscriber` so it gets `analysis_export` for free. Use it for the **datapath** golden model (values), leaving the scoreboard for **control/counts**.
+
+chk.svh:
+```systemverilog
+// Optional: call a C/C++ golden model over DPI. The .cpp must be passed to xrun.
+import "DPI-C" function int vliw(input int data, input int operation, input int operand);
+
+class chk extends uvm_subscriber #(full_item);
+  `uvm_component_utils(chk)
+
+  bit enable_chk = 0;
+  // no port declaration needed -- uvm_subscriber provides analysis_export
+
+  function new(string name, uvm_component parent);
+    super.new(name, parent);
+  endfunction: new
+
+  virtual function void build_phase(uvm_phase phase);
+    super.build_phase(phase);
+    if (!uvm_config_db#(bit)::get(this, "", "enable_chk", enable_chk))
+        `uvm_fatal(get_type_name(), "Bad config")
+  endfunction: build_phase
+
+  // Datapath reference model: a real queue of the expected values
+  bit [DATA_WIDTH-1:0] q [$];
+
+  function void reset_model();
+    q.delete();
+  endfunction: reset_model
+
+  // uvm_subscriber declares write() as pure virtual -- this is mandatory
+  function void write(full_item t);
+    req_item req = t.m_req_item;
+    rsp_item rsp = t.m_rsp_item;
+    bit cmd_wr;
+    int op;
+
+    if (!enable_chk) return;
+    if (~req.rst_n) begin reset_model(); return; end
+
+    cmd_wr = req.we && !req.re && (req.addr >= BASE_CMD) && (req.addr <= BASE_CMD + OP_LAST);
+    op     = req.addr - BASE_CMD;
+
+    if (cmd_wr) begin
+      case (op)
+        OP_PUSH: q.push_back(req.data);
+        OP_POP:  if (q.size() > 0) void'(is_lifo() ? q.pop_back() : q.pop_front());
+
+        // Transform the model through the DPI golden model
+        OP_VLIW_ADD: begin
+          bit [DATA_WIDTH-1:0] transformed [$];
+          while (q.size() > 0)
+            transformed.push_back(vliw(q.pop_front(), op, req.data));
+          q = transformed;
+        end
+        default: ;
+      endcase
+    end
+
+    // Compare a streamed beat against the head of the model queue
+    if (is_streaming && q.size() > 0) begin
+      bit [DATA_WIDTH-1:0] expected = q.pop_front();
+      assert (rsp.data_op == expected) else
+        `uvm_error(get_type_name(), $sformatf("Stream mismatch: expected %0h, got %0h",
+                                              expected, rsp.data_op))
+    end
+  endfunction: write
+endclass: chk
+```
+> To use DPI, add the `.cpp` file to the `xrun` file list (see **Running commands**).
+
+### Coverage collector
+1) Extend `uvm_subscriber #(req_item)`
+2) Declare the covergroup **and the class members it samples** (a covergroup can only sample variables in scope when it was declared)
+3) `cg = new();` in the **constructor** — not in `build_phase`, or the first samples are lost
+4) In `write()`: latch the item into the members, then call `cg.sample()`
+
+cov.svh:
+```systemverilog
+class cov extends uvm_subscriber #(req_item);
+  `uvm_component_utils(cov)
+
+  req_item m_item;
+  bit enable_cov = 0;
+
+  typedef enum {ADDR_CFG, ADDR_STATUS, ADDR_DATA, ADDR_CMD, ADDR_OTHER} region_e;
+
+  // sampled fields -- the covergroup reads these members, not write()'s argument
+  region_e region;
+  int      op;
+
+  virtual function void build_phase(uvm_phase phase);
+    super.build_phase(phase);
+    if (!uvm_config_db#(bit)::get(this, "", "enable_cov", enable_cov))
+        `uvm_fatal(get_type_name(), "Bad config")
+  endfunction: build_phase
+
+  covergroup cg;
+    option.per_instance = 1; // report this instance separately
+
+    cp_rst: coverpoint m_item.rst_n { bins reset = {0}; bins run = {1}; }
+
+    cp_rw: coverpoint {m_item.we, m_item.re} {
+      bins wr   = {2'b10};
+      bins rd   = {2'b01};
+      bins idle = {2'b00};
+      illegal_bins bad = {2'b11}; // hitting this is a run-time error
+    }
+
+    cp_region: coverpoint region; // enum: auto bins, one per value
+
+    // cross with named bins: keep the legal combinations, flag the illegal ones
+    x_access: cross cp_rw, cp_region {
+      bins wr_cfg    = binsof(cp_region) intersect {ADDR_CFG}    && binsof(cp_rw.wr);
+      bins rd_status = binsof(cp_region) intersect {ADDR_STATUS} && binsof(cp_rw.rd);
+      bins wr_cmd    = binsof(cp_region) intersect {ADDR_CMD}    && binsof(cp_rw.wr);
+      illegal_bins ill_wr_status = binsof(cp_region) intersect {ADDR_STATUS} && binsof(cp_rw.wr);
+      illegal_bins ill_rd_cmd    = binsof(cp_region) intersect {ADDR_CMD}    && binsof(cp_rw.rd);
+    }
+
+    // iff guard: only sample this coverpoint when the condition holds
+    cp_op: coverpoint op iff (region == ADDR_CMD && m_item.we) {
+      bins push   = {OP_PUSH};
+      bins pop    = {OP_POP};
+      bins stream = {OP_STREAM};
+      illegal_bins others = default; // everything not named above
+    }
+
+    cp_qmode:       coverpoint m_item.data[2:1] iff (region == ADDR_CFG && m_item.we) {
+      bins lifo = {2'b01};
+      bins fifo = {2'b10};
+      illegal_bins invalid = {2'b00, 2'b11};
+    }
+    cp_stream_mode: coverpoint m_item.data[5] iff (region == ADDR_CFG && m_item.we);
+
+    // cross without a body: every combination becomes a bin
+    x_mode: cross cp_qmode, cp_stream_mode;
+
+    // an expression works as a coverpoint too
+    cp_push_parity: coverpoint (m_item.data[24] == (^m_item.data[23:0]))
+        iff (region == ADDR_CMD && m_item.we && op == OP_PUSH) {
+      bins good_parity = {1};
+      bins bad_parity  = {0};
+    }
+  endgroup
+
+  function new(string name, uvm_component parent);
+    super.new(name, parent);
+    cg = new(); // MUST be here, not build_phase
+  endfunction: new
+
+  function void write(req_item t);
+    if (!enable_cov) return;
+
+    // Latch into the members the covergroup reads
+    m_item = t;
+    op     = m_item.addr - BASE_CMD;
+
+    if      (m_item.addr == BASE_CFG)    region = ADDR_CFG;
+    else if (m_item.addr == BASE_STATUS) region = ADDR_STATUS;
+    else if (m_item.addr >= BASE_CMD &&
+             m_item.addr <= BASE_CMD + OP_LAST) region = ADDR_CMD;
+    else region = ADDR_OTHER;
+
+    if (!m_item.rst_n) return; // don't cover reset
+
+    cg.sample();
+  endfunction: write
+endclass: cov
+```
+
+Covergroup syntax reference:
+| Construct | Meaning |
+|---|---|
+| `bins name = {a, b}` | one bin, hit by either value |
+| `bins name[] = {[a:b]}` | one bin **per value** in the range |
+| `bins name[N] = {[a:b]}` | range split into N bins |
+| `illegal_bins name = ...` | run-time error if hit |
+| `ignore_bins name = ...` | excluded from the coverage score |
+| `default` | everything not matched by a named bin |
+| `coverpoint x iff (cond)` | only sample when `cond` is true |
+| `cross a, b` | all combinations of two coverpoints |
+| `binsof(cp) intersect {v}` | select the part of a cross where `cp` took value `v` |
+| `option.per_instance = 1` | score each instance separately, not merged by type |
+
+> Coverage only advances when `sample()` is called, and `enable_cov`/`enable_chk` come from the `env` via the config db — a run with them unset (or `uvm_fatal`-ing) collects nothing.
+
 ## UVM sequences
 Sequences encapsulate and execute sequence items
 
@@ -445,6 +739,41 @@ class fill_queue_seq extends uvm_sequence #(req_item, rsp_item);
 endclass: fill_queue_seq
 ```
 
+Lastly, a sequence library runs sequences from a pool at random, a random number of times.
+
+1) Extend `uvm_sequence_library #(req_item, rsp_item)`
+2) Add both `uvm_object_utils` and `uvm_sequence_library_utils`
+3) Register the sequence **types** with `add_typewide_sequences({...})`
+4) Call `init_sequence_library()` last in the constructor
+
+```systemverilog
+class my_seq_lib extends uvm_sequence_library #(req_item, rsp_item);
+  `uvm_object_utils(my_seq_lib)
+  `uvm_sequence_library_utils(my_seq_lib)
+
+  function new(string name = "my_seq_lib");
+    super.new(name);
+
+    add_typewide_sequences({
+      fill_fill_seq::get_type(),
+      fill_empty_fill_seq::get_type(),
+      random_seq::get_type(),
+      stream_valid_seq::get_type(),
+      parity_err_seq::get_type(),
+      vliw_seq::get_type(),
+      reset_mid_stream_seq::get_type()
+    });
+
+    init_sequence_library();
+  endfunction: new
+endclass: my_seq_lib
+```
+Knobs (all `rand`, so `randomize()` the library before `start()`):
+- `selection_mode`: `UVM_SEQ_LIB_RAND` (default), `UVM_SEQ_LIB_RANDC`, `UVM_SEQ_LIB_ITEM`, `UVM_SEQ_LIB_USER`
+- `min_random_count` / `max_random_count`: how many sequences to run (both default 10)
+
+> Sequences run in random order, so each must be safe standalone — that is why they all start with their own `` `uvm_do(reset1) `` instead of assuming the previous sequence left the DUT configured.
+
 Refer to **tst.svh** on how to choose which sequence to execute.
 
 ## Encapsulating UVM components
@@ -528,6 +857,43 @@ class lab5 extends uvm_test;
         phase.drop_objection (this); // ...done running
     endtask
 endclass: lab5
+```
+> Add `phase.phase_done.set_drain_time(this, 20ns);` before raising the objection, otherwise the phase ends the moment the last item is driven and the monitor never sees the final responses.
+
+To run a sequence library instead, set its knobs, randomize, and start it like any other sequence:
+```systemverilog
+class test_seq_lib extends uvm_test;
+    `uvm_component_utils(test_seq_lib)
+
+    env m_env;
+
+    function new(string name="test_seq_lib", uvm_component parent);
+        super.new(name, parent);
+    endfunction: new
+
+    virtual function void build_phase(uvm_phase phase);
+        super.build_phase (phase);
+        uvm_config_db #(bit)::set(this, "m_env", "enable_cov", 1);
+        uvm_config_db #(bit)::set(this, "m_env", "enable_chk", 1);
+        m_env = env::type_id::create ("m_env", this);
+    endfunction
+
+    task main_phase(uvm_phase phase);
+        my_seq_lib m_seq_lib = my_seq_lib::type_id::create("m_seq_lib");
+        phase.raise_objection(this, "Raising Main Objection");
+
+        // Set constraints here
+        m_seq_lib.min_random_count = 10;
+        m_seq_lib.max_random_count = 20;
+
+        if (!m_seq_lib.randomize())
+            `uvm_error(get_type_name(), "Library failed to randomize")
+
+        m_seq_lib.start(m_env.m_agt.m_sqr);
+
+        phase.drop_objection(this, "Dropping Main Objection");
+    endtask: main_phase
+endclass: test_seq_lib
 ```
 
 ## Running commands
